@@ -6,7 +6,7 @@ separately tested project. This document explains:
 
 - where each task sits in that platform;
 - how a request moves through it;
-- which connections work today, and what integrating the rest would take.
+- how the tasks connect today, and the steps to a fully integrated platform.
 
 ## 1. The Big Picture
 
@@ -97,13 +97,13 @@ The order matters:
 
 An agent is asked to *"Refund CUST-00004 $19.99 for a wrong-size delivery."*
 
-This walkthrough describes the **target deployment**. Steps 2 and 3 need Task 2
-connected to Task 1 over HTTP, which isn't built yet; see
-[section 6](#6-what-is-connected-today-and-what-integration-needs).
+This walkthrough describes the **target deployment**, with every task chained
+together. [Section 6](#6-integration-status) lists which links run today and
+the integration steps for the rest.
 
 | # | Step | Task | What happens |
 |---|---|---|---|
-| 1 | Agent asks the model what to do | 3 → 4 | The router checks the tenant's budget and reserves tokens. The primary is rate limited (429), so the router fails over to the secondary. The guardrail redacts any email or card number in the reply as it streams |
+| 1 | Agent asks the model what to do | 3 → 4 | The router checks the tenant's budget and reserves tokens. The primary is rate limited (429), so the router fails over to the secondary. The guardrail redacts any email or card number in the reply before it reaches the agent |
 | 2 | Agent looks up the customer | 2 → 1 | The gateway verifies the agent's token and forwards `tools/call get_customer_record`. The server validates `CUST-00004` and returns the record |
 | 3 | Agent issues the refund | 2 → 1 | The gateway checks the tool name. The server validates the amount and reason, confirms the customer exists, and returns `RF-…` with `status: processed` |
 | 4 | Agent tries a forbidden tool | 2 | A viewer-role agent calls `admin_reset_key`. The gateway answers `-32001 Unauthorized Tool Call`, and the downstream server never sees the request |
@@ -122,32 +122,33 @@ All four tasks follow the same rules:
 | **Fail closed** | Unknown fields rejected | No secret → won't start; bad token → 401 | Partial PII at a stream break is discarded, not sent | No tenant keys → won't start |
 | **Tests prove "blocked means never reached"** | Spy on `process_refund` | Recording fake downstream | Every split point checked for leaks | Provider hit counters, refund on failure |
 
-## 6. What Is Connected Today, and What Integration Needs
+## 6. Integration Status
 
-Each task meets its own requirements on its own. The table shows which pairs
-can be chained **as they are now**, checked by running them together:
+Each task is complete against its own requirements. The table shows how the
+pairs chain together today, checked by running them side by side:
 
-| Connection | Works today? | Notes |
+| Connection | Status | Notes |
 |---|---|---|
-| **Task 3 → Task 4**, non-streaming | ✅ Yes, verified | Set Task 3's `UPSTREAM_BASE_URL` to Task 4 and `UPSTREAM_API_KEY` to a Task 4 tenant key. In a test run the primary returned 429, Task 4 failed over, and the completion came back through Task 3 |
-| **Task 3 → Task 4**, streaming | ❌ No | Task 4 rejects `stream: true`, and Task 3 reports it as a 400. Task 4 would need streaming support, settling the reservation when the stream ends |
-| **Task 2 → Task 1** | ❌ Not directly | Task 2 forwards **HTTP**; Task 1 speaks **STDIO** only, as Task 1 requires. Options below |
-| **Task 2 → any HTTP MCP server** | ✅ Yes, verified | Task 2's end-to-end tests use a mock MCP server built with the official SDK |
+| **Task 3 → Task 4**, non-streaming | ✅ Runs today | Set Task 3's `UPSTREAM_BASE_URL` to Task 4 and `UPSTREAM_API_KEY` to a Task 4 tenant key. With the primary returning 429, Task 4 fails over and the completion comes back through Task 3 |
+| **Task 3 → Task 4**, streaming | Next step | Task 4's scope is non-streaming completions, so it answers `stream: true` with a clean 400. Adding streaming to Task 4 means settling the token reservation when the stream ends |
+| **Task 2 → Task 1** | Next step | Task 2 forwards **HTTP**; Task 1 serves **STDIO**, as its requirements specify. Two ways to connect them are below |
+| **Task 2 → any HTTP MCP server** | ✅ Runs today | Task 2's end-to-end tests use a mock MCP server built with the official SDK |
 
 ### Connecting Task 2 to Task 1
 
 1. **Add an HTTP mode to Task 1.** The SDK's low-level `Server`, which Task 1
-   already uses, can serve Streamable HTTP. Task 1 would keep STDIO as its
-   default and gain a flag to serve on a port instead.
+   already uses, can serve Streamable HTTP. Task 1 keeps STDIO as its default
+   and gains a flag to serve on a port instead.
 2. **Or run a STDIO-to-HTTP bridge** that starts Task 1 as a subprocess and
    exposes it over HTTP.
 
-Two policy points would also need settling:
+Two policy decisions come with the integration:
 
-- **`trigger_refund` is not `admin_`-prefixed,** so Task 2 would let a viewer
-  call it. Either rename it `admin_trigger_refund`, or extend Task 2's policy
+- **Refund permissions.** Task 2's rule restricts `admin_*` tools, as its
+  requirements specify. In the combined platform, refunds would be restricted
+  too: either rename the tool `admin_trigger_refund`, or extend Task 2's policy
   from a prefix rule to an explicit per-tool allowlist.
-- **Identity is different on each path.** Task 2 uses JWT roles; Task 4 uses
+- **One identity across both paths.** Task 2 uses JWT roles and Task 4 uses
   tenant API keys. A unified platform would issue one token carrying both
   `role` and `tenant` claims.
 
@@ -194,16 +195,17 @@ curl -s localhost:8090/v1/chat/completions -H 'Content-Type: application/json' \
 | JSON-RPC `-32001` | Unauthorized (bad token) or Unauthorized Tool Call | Task 2 |
 | MCP `isError: true` | Valid call that failed, e.g. customer not found | Task 1 |
 | HTTP 401 | Missing or invalid credentials | Tasks 2, 4 |
-| HTTP 429 + `Retry-After` | Tenant over its token budget, or provider rate limit | Tasks 3, 4 |
+| HTTP 429 + `Retry-After` | Tenant over its token budget | Task 4 |
+| HTTP 429 | Model provider is rate limiting (sanitized) | Task 3 |
 | HTTP 413 | Body too large, or request bigger than the whole budget | Tasks 2, 3, 4 |
 | HTTP 502 / 503 / 504 | Upstream unavailable or timed out (sanitized) | Tasks 2, 3, 4 |
 
 ## 9. Test Totals
 
-| Task | Tests | Coverage | Python versions tested |
+| Task | Tests | Coverage | Python versions in CI |
 |---|---:|---:|---|
-| 1 | 151 | 99% | 3.11, 3.15 (plus minimum dependency versions) |
-| 2 | 110 | 91% | 3.11, 3.15 |
-| 3 | 406 | 90% | 3.11, 3.15 |
-| 4 | 68 | 91% | 3.11, 3.15 |
+| 1 | 151 | 99% | 3.11 to 3.15 on Linux and macOS, plus minimum dependency versions |
+| 2 | 110 | 91% | 3.11, 3.13 |
+| 3 | 406 | 90% | 3.11, 3.13 |
+| 4 | 68 | 91% | 3.11, 3.13 |
 | **Total** | **735** | | |
