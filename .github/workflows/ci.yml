@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # --- Task 1: customer MCP server (lockfile, full version matrix) ---------
+
+  task1-lint:
+    name: "Task 1: lint and type check"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: task1-customer-mcp-server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements-dev.lock && pip install --no-deps -e .
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: mypy
+
+  task1-test:
+    name: "Task 1: test (Python ${{ matrix.python-version }}, ${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: task1-customer-mcp-server
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.11", "3.12", "3.13", "3.14", "3.15"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
+      - run: pip install -r requirements-dev.lock && pip install --no-deps -e .
+      - run: pytest --cov
+
+  task1-minimum-versions:
+    name: "Task 1: minimum dependency versions"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: task1-customer-mcp-server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install uv
+      - run: uv pip install --system --resolution lowest-direct -e ".[dev]"
+      - run: pytest
+
+  # --- Tasks 2-4: gateways and router --------------------------------------
+
+  tasks-2-4:
+    name: "${{ matrix.task }} (Python ${{ matrix.python-version }})"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ matrix.task }}
+    strategy:
+      fail-fast: false
+      matrix:
+        task:
+          - task2-mcp-security-gateway
+          - task3-llm-guardrail-gateway
+          - task4-llm-fallback-router
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e ".[dev]"
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: mypy
+      - run: pytest --cov
